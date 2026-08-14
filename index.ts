@@ -1,9 +1,13 @@
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_PANEL_SIZE = 3;
 const MAX_PANEL_SIZE = 4;
 const START_TIMEOUT_MS = 60_000;
+const SHELL_READY_TIMEOUT_MS = 30_000;
+const SHELL_READY_RETRY_MS = 500;
 const ANSWER_TIMEOUT_MS = 10 * 60_000;
 const MAX_RESULT_CHARS = 24_000;
 
@@ -77,11 +81,27 @@ const PRESET_NAMES = Object.keys(PRESETS) as PresetName[];
 type ExecResult = { stdout: string; stderr: string; code: number | null };
 type PaneRect = { width: number; height: number };
 
-function parseArguments(args: string): { count: number; presetName: PresetName; prompt: string } {
+class HerdrCommandError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = "HerdrCommandError";
+  }
+}
+
+function parseArguments(args: string): {
+  count: number;
+  presetName: PresetName;
+  keepPanes: boolean;
+  prompt: string;
+} {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   let count = DEFAULT_PANEL_SIZE;
   let countSet = false;
   let presetName: PresetName = "general";
+  let keepPanes = false;
   const promptTokens: string[] = [];
 
   for (let i = 0; i < tokens.length; i++) {
@@ -94,6 +114,8 @@ function parseArguments(args: string): { count: number; presetName: PresetName; 
       const value = token.slice("--preset=".length) as PresetName;
       if (!PRESET_NAMES.includes(value)) throw new Error(`Unknown preset: ${value}`);
       presetName = value;
+    } else if (token === "--keep-panes") {
+      keepPanes = true;
     } else if (/^\d+$/.test(token) && promptTokens.length === 0 && !countSet) {
       count = Number(token);
       countSet = true;
@@ -102,26 +124,43 @@ function parseArguments(args: string): { count: number; presetName: PresetName; 
     }
   }
 
-  return { count, presetName, prompt: promptTokens.join(" ").trim() };
+  return { count, presetName, keepPanes, prompt: promptTokens.join(" ").trim() };
 }
 
-function childPiArgs(preset: Preset, persona: Persona, model: string, thinking: string): string[] {
+function childPrompt(preset: Preset, persona: Persona): string {
   const personaInstruction = `Your assigned panel lens: ${persona.label}. ${persona.prompt}`;
+  return preset.systemPrompt
+    ? `${preset.systemPrompt}\n\n${personaInstruction}`
+    : `${personaInstruction}\n\nYou are one member of an independent review panel. Answer the user's task directly and do not delegate it to other agents.`;
+}
+
+function childPiArgs(preset: Preset, promptPath: string, model: string, thinking: string): string[] {
   const args = ["--model", model, "--thinking", thinking];
   if (preset.systemPrompt) {
-    args.push("--system-prompt", `${preset.systemPrompt}\n\n${personaInstruction}`);
-    args.push("--no-context-files", "--no-skills");
+    // Pi treats an existing path as prompt-file input. Passing only the path also
+    // avoids Herdr rejecting multiline text that cannot be encoded safely by the target shell.
+    args.push("--system-prompt", promptPath, "--no-context-files", "--no-skills");
     if (preset.tools) args.push("--tools", preset.tools);
     else args.push("--no-tools");
   } else {
-    args.push("--append-system-prompt", `${personaInstruction}\n\nYou are one member of an independent review panel. Answer the user's task directly and do not delegate it to other agents.`);
+    args.push("--append-system-prompt", promptPath);
   }
   return args;
 }
 
 function parseJson(result: ExecResult, operation: string): any {
   if (result.code !== 0) {
-    throw new Error(`${operation} failed: ${(result.stderr || result.stdout).trim() || `exit ${result.code}`}`);
+    const raw = (result.stderr || result.stdout).trim();
+    try {
+      const payload = JSON.parse(raw);
+      throw new HerdrCommandError(
+        `${operation} failed: ${payload?.error?.message ?? raw}`,
+        payload?.error?.code,
+      );
+    } catch (error) {
+      if (error instanceof HerdrCommandError) throw error;
+      throw new HerdrCommandError(`${operation} failed: ${raw || `exit ${result.code}`}`);
+    }
   }
   try {
     return JSON.parse(result.stdout);
@@ -133,6 +172,27 @@ function parseJson(result: ExecResult, operation: string): any {
 async function herdr(pi: ExtensionAPI, args: string[], timeout?: number): Promise<any> {
   const result = (await pi.exec("herdr", args, { timeout })) as ExecResult;
   return parseJson(result, `herdr ${args.slice(0, 2).join(" ")}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function startAgentWhenShellReady(
+  pi: ExtensionAPI,
+  args: string[],
+): Promise<any> {
+  const deadline = Date.now() + SHELL_READY_TIMEOUT_MS;
+  while (true) {
+    try {
+      return await herdr(pi, args, START_TIMEOUT_MS + 10_000);
+    } catch (error) {
+      if (!(error instanceof HerdrCommandError) || error.code !== "agent_pane_busy" || Date.now() >= deadline) {
+        throw error;
+      }
+      await sleep(SHELL_READY_RETRY_MS);
+    }
+  }
 }
 
 function paneIdFromSplit(response: any): string {
@@ -262,10 +322,10 @@ async function createPanel(args: string, ctx: ExtensionCommandContext, pi: Exten
     ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
     return;
   }
-  const { count, presetName, prompt } = parsed;
+  const { count, presetName, keepPanes, prompt } = parsed;
   const preset = PRESETS[presetName];
   if (!prompt) {
-    ctx.ui.notify("Usage: /herdr-panel [2-4] [--preset general|research|decision|creative|code] <prompt>", "warning");
+    ctx.ui.notify("Usage: /herdr-panel [2-4] [--preset <name>] [--keep-panes] <prompt>", "warning");
     return;
   }
   if (!Number.isInteger(count) || count < 2 || count > MAX_PANEL_SIZE) {
@@ -285,6 +345,8 @@ async function createPanel(args: string, ctx: ExtensionCommandContext, pi: Exten
   const suffix = Date.now().toString(36).slice(-5);
   const selected = preset.personas.slice(0, count);
   const paneIds: string[] = [];
+  const closedPaneIds = new Set<string>();
+  let promptDir: string | undefined;
 
   ctx.ui.setStatus("herdr-panel", `creating ${count} agents…`);
   try {
@@ -309,16 +371,24 @@ async function createPanel(args: string, ctx: ExtensionCommandContext, pi: Exten
       paneIds.push(paneId);
     }
 
-    const agents = selected.map((persona, index) => ({
-      persona,
-      paneId: paneIds[index],
-      agentName: `panel-${persona.id}-${suffix}`,
-    }));
+    promptDir = await mkdtemp(join(tmpdir(), "herdr-panel-"));
+    const agents = await Promise.all(
+      selected.map(async (persona, index) => {
+        const promptPath = join(promptDir!, `${persona.id}.md`);
+        await writeFile(promptPath, childPrompt(preset, persona), { encoding: "utf8", mode: 0o600 });
+        return {
+          persona,
+          promptPath,
+          paneId: paneIds[index],
+          agentName: `panel-${persona.id}-${suffix}`,
+        };
+      }),
+    );
 
     ctx.ui.setStatus("herdr-panel", `starting ${count} × ${ctx.model.id}…`);
     await Promise.all(
-      agents.map(({ persona, paneId, agentName }) =>
-        herdr(
+      agents.map(({ promptPath, paneId, agentName }) =>
+        startAgentWhenShellReady(
           pi,
           [
             "agent",
@@ -331,49 +401,76 @@ async function createPanel(args: string, ctx: ExtensionCommandContext, pi: Exten
             "--timeout",
             String(START_TIMEOUT_MS),
             "--",
-            ...childPiArgs(preset, persona, model, thinking),
+            ...childPiArgs(preset, promptPath, model, thinking),
           ],
-          START_TIMEOUT_MS + 10_000,
         ),
       ),
     );
 
-    ctx.ui.setStatus("herdr-panel", `${count} agents working…`);
+    let finishedCount = 0;
+    const updateProgress = () => {
+      const workingCount = count - finishedCount;
+      ctx.ui.setStatus(
+        "herdr-panel",
+        workingCount > 0
+          ? `${workingCount} agent${workingCount === 1 ? "" : "s"} working · ${finishedCount}/${count} finished`
+          : `${finishedCount}/${count} agents finished`,
+      );
+    };
+    updateProgress();
+
     const settled = await Promise.allSettled(
-      agents.map(({ agentName }) =>
-        herdr(
-          pi,
-          ["agent", "prompt", agentName, prompt, "--wait", "--timeout", String(ANSWER_TIMEOUT_MS)],
-          ANSWER_TIMEOUT_MS + 10_000,
-        ),
-      ),
+      agents.map(async ({ persona, agentName, paneId }) => {
+        try {
+          await herdr(
+            pi,
+            ["agent", "prompt", agentName, prompt, "--wait", "--timeout", String(ANSWER_TIMEOUT_MS)],
+            ANSWER_TIMEOUT_MS + 10_000,
+          );
+          return { persona, agentName, answer: await collectAnswer(pi, agentName) };
+        } finally {
+          finishedCount += 1;
+          updateProgress();
+          if (!keepPanes) {
+            try {
+              await herdr(pi, ["pane", "close", paneId]);
+              closedPaneIds.add(paneId);
+            } catch {
+              // A user may already have closed the pane; outer cleanup gets one final chance.
+            }
+          }
+        }
+      }),
     );
 
-    const completed = agents.filter((_, index) => settled[index].status === "fulfilled");
+    const results = settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
     const failed = agents.filter((_, index) => settled[index].status === "rejected");
-    if (completed.length === 0) {
+    if (results.length === 0) {
       throw new Error(`All panel agents failed to settle: ${failed.map((agent) => agent.agentName).join(", ")}`);
     }
-
-    ctx.ui.setStatus("herdr-panel", `collecting ${completed.length} reports…`);
-    const results = await Promise.all(
-      completed.map(async ({ persona, agentName }) => ({
-        persona,
-        agentName,
-        answer: await collectAnswer(pi, agentName),
-      })),
-    );
 
     if (failed.length > 0) {
       ctx.ui.notify(`Panel completed with ${failed.length} failed agent(s): ${failed.map((a) => a.agentName).join(", ")}`, "warning");
     }
 
-    ctx.ui.notify(`Collected ${results.length}/${count} panel reports; child panes remain open`, "info");
+    const paneMessage = keepPanes ? "; child panes remain open" : "; child panes closed";
+    ctx.ui.notify(`Collected ${results.length}/${count} panel reports${paneMessage}`, "info");
     pi.sendUserMessage(synthesisPrompt(prompt, model, presetName, results));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(`herdr-panel failed: ${message}`, "error");
   } finally {
+    if (!keepPanes) {
+      await Promise.allSettled(
+        paneIds
+          .filter((paneId) => !closedPaneIds.has(paneId))
+          .map(async (paneId) => {
+            await herdr(pi, ["pane", "close", paneId]);
+            closedPaneIds.add(paneId);
+          }),
+      );
+    }
+    if (promptDir) await rm(promptDir, { recursive: true, force: true }).catch(() => undefined);
     ctx.ui.setStatus("herdr-panel", undefined);
   }
 }

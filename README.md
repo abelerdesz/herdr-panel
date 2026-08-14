@@ -58,6 +58,12 @@ Select a preset with `--preset` or `--preset=<name>`:
 /herdr-panel --preset code Review the authentication architecture in this repository
 ```
 
+By default, each child pane closes after its report has been collected. Keep all child panes open for inspection or follow-up with:
+
+```text
+/herdr-panel 4 --preset decision --keep-panes Should I rent or buy?
+```
+
 Quotes are not required around prompts entered as Pi slash commands.
 
 List all presets and their personas:
@@ -144,11 +150,12 @@ For each invocation, the extension:
 3. Passes the parent session's exact `provider/model` selection and thinking level to every child.
 4. Configures each child with its preset and persona.
 5. Submits the same user prompt to all children concurrently.
-6. Waits for Herdr to report that each child has settled.
+6. Tracks and displays the number of agents still working as each child settles.
 7. Reads each child's final answer from its Pi session, falling back to terminal output when necessary.
-8. Sends the collected reports to the parent Pi session for synthesis.
+8. Closes that child's pane unless `--keep-panes` was supplied.
+9. Sends the collected reports to the parent Pi session for synthesis.
 
-The child panes remain open afterward so their sessions can be inspected or continued manually.
+Closing a Herdr pane terminates its terminal, including the shell and Pi process running inside it. Use `--keep-panes` when the child sessions should remain interactive.
 
 ## Model and context behavior
 
@@ -165,7 +172,8 @@ The final synthesis happens in the parent session and therefore uses the parent'
 - Answer timeout: 10 minutes.
 - Each report is capped before synthesis to protect the parent context window.
 - A panel makes one model run per child plus a parent synthesis run, so cost and rate-limit usage scale with panel size.
-- The extension creates panes but does not close them automatically.
+- Child panes close as they finish by default; `--keep-panes` leaves all of them open.
+- If setup or orchestration fails, panes created by that invocation are also cleaned up unless `--keep-panes` was supplied.
 - If some agents fail, available reports are still synthesized. If all agents fail, the command reports an error.
 - Read-only tools prevent Pi tool-based writes, but extensions execute with normal OS permissions. Only install trusted extensions.
 
